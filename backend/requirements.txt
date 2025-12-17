@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+python-dotenv
+elasticsearch==8.12.1
+scikit-learn
+spacy
+sentence-transformers
+langdetect
+slowapi
+python-multipart
+Unidecode
+joblib
+spacy

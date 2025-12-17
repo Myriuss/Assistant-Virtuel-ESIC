@@ -1,0 +1,52 @@
+version: "3.9"
+
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: av_postgres
+    environment:
+      POSTGRES_DB: assistant
+      POSTGRES_USER: assistant
+      POSTGRES_PASSWORD: assistant
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: av_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+
+  backend:
+    build: ./backend
+    container_name: av_backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+      - ./scripts:/scripts
+      - ./data:/data
+    depends_on:
+      - postgres
+      - elasticsearch
+    ports:
+      - "8000:8000"
+
+  superset:
+    image: apache/superset:latest
+    container_name: av_superset
+    environment:
+      SUPERSET_SECRET_KEY: supersecretkey
+    ports:
+      - "8088:8088"
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:
