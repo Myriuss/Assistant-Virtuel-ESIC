@@ -14,3 +14,4 @@ python-multipart
 Unidecode
 joblib
 spacy
+prometheus-client==0.20.0
