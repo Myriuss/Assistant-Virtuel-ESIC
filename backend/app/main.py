@@ -15,6 +15,18 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from app.core.metrics import REQ_COUNT, REQ_LATENCY
 app = FastAPI(title="Assistant Virtuel Campus", version="1.0.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",  # Front React
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
