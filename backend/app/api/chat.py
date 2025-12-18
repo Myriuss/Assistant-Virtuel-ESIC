@@ -118,6 +118,13 @@ def chat(
     q_low = msg.lower()
     wants_contact = any(w in q_low for w in ["contacter", "joindre", "email", "mail", "téléphone", "telephone", "appeler"])
 
+    is_hours_question = any(w in q_low for w in ["horaire", "horaires", "ouvert", "ouverture", "heures"])
+    has_service = bool(entities.get("service_hint"))
+    if is_hours_question and not has_service:
+        answer = "Tu parles des horaires de quel service : scolarité, helpdesk, bibliothèque ?"
+        final_intent = "clarification"
+        final_confidence = 0.50
+
     # ---------------------------------------------------------
     # Variables réponse
     # ---------------------------------------------------------
