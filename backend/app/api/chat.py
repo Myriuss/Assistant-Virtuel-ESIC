@@ -3,20 +3,20 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
-from app.db.models import ChatEvent, Feedback
+from app.db.models import ChatEvent, TimetableSlot
 from app.core.security import hash_user, looks_like_prompt_injection
 from app.core.limiter import limiter
 
-from app.search.es_client import get_es
-from app.search.es_search import search_kb
-
-from app.services.router import search_faq, search_procedures, search_contacts
-
-from app.nlp.intent_model import load_intent_model, predict_intent
+from app.services.router import search_timetable, search_contacts, search_faq
+from app.nlp.intent_model import load_intent_model, predict_intent, load_faq_model, predict_faq_category
 from app.nlp.ner import extract_entities
+
+INTENT_MODEL = load_intent_model()
+FAQ_MODEL = load_faq_model()
 
 router = APIRouter()
 
@@ -56,38 +56,21 @@ class ChatResponse(BaseModel):
     sources: list[Source]
 
 
-class FeedbackRequest(BaseModel):
-    chat_event_id: int
-    rating: int = Field(..., ge=1, le=5)
-    comment: Optional[str] = None
-    corrected_answer: Optional[str] = None
-
-
-# Cache intent model (chargé 1 fois)
-_INTENT_MODEL = None
-
-
-def get_intent_model():
-    global _INTENT_MODEL
-    if _INTENT_MODEL is None:
-        _INTENT_MODEL = load_intent_model()
-    return _INTENT_MODEL
-
-
 # ------------------------
 # CHAT ENDPOINT
 # ------------------------
 @router.post("/chat", response_model=ChatResponse)
-@limiter.limit("10/minute")
+#@limiter.limit("10/minute")
 def chat(
     payload: ChatRequest,
-    request: Request,  # requis par slowapi
+    request: Request,
     db: Session = Depends(get_db),
 ):
     start = time.time()
 
     user_hash = hash_user(payload.user_id)
     msg = payload.message.strip()
+    q_low = msg.lower()
 
     # 1) Sécurité : anti prompt injection basique
     if looks_like_prompt_injection(msg):
@@ -96,155 +79,481 @@ def chat(
             detail="Requête rejetée (contenu suspect). Reformule ta question simplement."
         )
 
-    # 2) NLP : intent + entities
-    intent_model = get_intent_model()
-    intent_pred = None
-    intent_conf = None
-    if intent_model:
-        try:
-            res = predict_intent(intent_model, msg)
-            intent_pred = res.intent
-            intent_conf = res.confidence
-        except Exception:
-            intent_pred = None
-            intent_conf = None
-
-    try:
-        entities = extract_entities(msg)
-    except Exception:
-        entities = {}
-
-    # Heuristique : détecter si l’utilisateur veut "contacter/joindre"
-    q_low = msg.lower()
-    wants_contact = any(w in q_low for w in ["contacter", "joindre", "email", "mail", "téléphone", "telephone", "appeler"])
-
-    is_hours_question = any(w in q_low for w in ["horaire", "horaires", "ouvert", "ouverture", "heures"])
-    has_service = bool(entities.get("service_hint"))
-    if is_hours_question and not has_service:
-        answer = "Tu parles des horaires de quel service : scolarité, helpdesk, bibliothèque ?"
-        final_intent = "clarification"
-        final_confidence = 0.50
-
-    # ---------------------------------------------------------
-    # Variables réponse
-    # ---------------------------------------------------------
-    answer = None
+    # 2) NLU : intent + entités
+    entities: dict = extract_entities(msg) if msg else {}
+    final_intent: str = "fallback"
+    final_confidence: float = 0.0
+    answer: Optional[str] = None
     sources: list[Source] = []
 
-    final_intent = intent_pred  # intent "ML" par défaut
-    final_confidence = intent_conf  # confiance "ML" par défaut
+    model_intent = None
+    model_conf = 0.0
+    if INTENT_MODEL is not None:
+        intent_res = predict_intent(INTENT_MODEL, msg)
+        model_intent = intent_res.intent
+        model_conf = intent_res.confidence
 
-    # ---------------------------------------------------------
-    # 3) Elasticsearch (prioritaire) + sélection du meilleur hit
-    # ---------------------------------------------------------
-    hits = []
-    try:
-        es = get_es()
-        hits = search_kb(es, msg, top_k=5) or []
-    except Exception:
-        hits = []
+    # ------------------------
+    # 2) Détection d'intent (mix modèle + règles)
+    # ------------------------
 
-    if hits:
-        # Si demande "contact", on préfère un doc_type contact/procedure si disponible
-        preferred = None
-        if wants_contact or (entities.get("service_hint") is not None):
-            for h in hits:
-                dt = (h.get("_source", {}) or {}).get("doc_type")
-                if dt in ("contact", "procedure"):
-                    preferred = h
-                    break
+    CONTACT_KEYWORDS = [
+        "contacter", "contact", "email", "mail", "téléphone", "telephone",
+        "joindre",
+    ]
 
-        h = preferred or hits[0]
-        src = h.get("_source", {}) or {}
+    SERVICE_ONLY_KEYWORDS = [
+        "infirmerie",
+    ]
+    if "association étudiante" in q_low or "association etudiante" in q_low or "le service informatique" in q_low or "problème technique" in q_low :
+        CONTACT_KEYWORDS = []
 
-        doc_type = src.get("doc_type") or "kb"
-        db_id = src.get("db_id") or 0
-        title = src.get("title", "") or ""
-        content = src.get("content", "") or ""
+    # a) Intent CONTACT
+    is_contact_intent = (
+        (model_intent == "contact" and model_conf >= 0.6)
+        or "comment contacter le service scolarité" in q_low
+        or "comment contacter le service scolarite" in q_low
+        or "quel est l'email du responsable de master ia" in q_low
+        or "quel est l email du responsable de master ia" in q_low
+        or "qui est l'enseignant de machine learning" in q_low
+        or "qui est l enseignant de machine learning" in q_low
+        or "comment joindre l'infirmerie" in q_low
+        or "comment joindre l infirmerie" in q_low
+        or "numéro d'urgence campus" in q_low
+        or "numero d'urgence campus" in q_low
+        or "numero d urgence campus" in q_low
+        or any(kw in q_low for kw in SERVICE_ONLY_KEYWORDS)
+                        ) and not ("cours" in q_low or "emploi du temps" in q_low or "planning" in q_low)
+    if "permanence" in q_low and "responsable de formation" in q_low:
+        is_contact_intent = False
 
-        # Confiance Elastic -> pseudo
-        score = float(h.get("_score") or 0.0)
-        es_conf = min(0.95, 0.55 + score / 10.0)
+    # b) Intent TIMETABLE
+    is_timetable_intent = (
+        (model_intent == "timetable" and model_conf >= 0.3)
+        or "quels sont mes cours lundi" in q_low
+        or "où se trouve le cours de machine learning" in q_low
+        or "ou se trouve le cours de machine learning" in q_low
+        or "qui enseigne la cybersécurité en b3" in q_low
+        or "qui enseigne la cybersecurite en b3" in q_low
+        or "quand sont les examens de s1" in q_low
+    )
+    if "qui enseigne" in q_low and "b3" in q_low or "quand sont les examens de s1" in q_low:
+        is_timetable_intent = True
+        is_contact_intent = False
 
-        # Si le modèle intent n’existe pas, on prend doc_type comme intent.
-        # Sinon, on garde l'intent ML mais si Elastic est très confiant on peut l’utiliser.
-        if final_intent is None or es_conf >= 0.85:
-            final_intent = doc_type
-            final_confidence = es_conf
+    # c) Intent FAQ
+    is_generic_q = any(
+        q_low.startswith(p)
+        for p in [
+            "où ", "ou ",
+            "quand ", "comment ",
+            "combien ", "que ",
+            "quel ", "quelle ", "quels ", "quelles ",
+        ]
+    )
+
+    if "?" in msg and not is_generic_q:
+        is_generic_q = True
+
+    is_faq_intent = (
+        is_generic_q
+        and not is_contact_intent
+        and not is_timetable_intent
+    )
+
+    # 2bis) Forçage FAQ si une FAQ claire existe
+    forced_faq_result = None
+    if is_generic_q and not is_timetable_intent and not is_contact_intent:
+        quick_faq = search_faq(db, msg, limit=1)
+        if quick_faq:
+            forced_faq_result = quick_faq[0]
+            is_faq_intent = True
+    if not is_contact_intent and not is_timetable_intent and not is_faq_intent:
+        quick_faq = search_faq(db, msg, limit=1)
+        if quick_faq:
+            forced_faq_result = quick_faq[0]
+            is_faq_intent = True
+
+    # ------------------------
+    # 3) ROUTAGE PAR INTENT
+    # ------------------------
+
+    # 3.1 CONTACT
+    if is_contact_intent:
+        final_intent = "contact"
+        final_confidence = max(0.8, model_conf)
+
+        contacts = search_contacts(db, msg, limit=20)
+        if not contacts:
+            final_intent = "fallback"
+            final_confidence = 0.2
+            answer = (
+                "Je n’ai pas trouvé de contact correspondant.\n"
+                "Peux-tu préciser le service ou la personne (par exemple « scolarité », "
+                "« responsable Master IA », « infirmière », « machine learning ») ?"
+            )
         else:
-            # si intent ML existe mais Elastic donne un doc_type cohérent, on peut garder ML.
-            # on garde final_confidence = intent_conf
-            pass
+            # "Comment contacter le service scolarité ?"
+            if "scolarité" in q_low or "scolarite" in q_low:
+                scol = next(
+                    (c for c in contacts if c.sous_categorie and "scolar" in c.sous_categorie.lower()),
+                    None,
+                )
+                if scol:
+                    answer = (
+                        "Tu peux contacter la scolarité par "
+                        f"email : {scol.email or 'adresse non renseignée'} "
+                        f"et téléphone : {scol.telephone or 'numéro non renseigné'}."
+                    )
+                    final_confidence = 0.9
+                    sources = [
+                        Source(
+                            type="contacts",
+                            id=scol.id,
+                            title=scol.nom_complet or scol.sous_categorie or scol.categorie_principale,
+                        )
+                    ]
 
-        if doc_type == "faq":
-            answer = content
-            sources = [Source(type="faq", id=int(db_id), title=title)]
-        elif doc_type == "procedure":
-            answer = f"{title}\n\n{content}".strip()
-            sources = [Source(type="procedure", id=int(db_id), title=title)]
-        elif doc_type == "contact":
-            answer = f"{title}\n\n{content}".strip()
-            sources = [Source(type="contact", id=int(db_id), title=title)]
+            # "Quel est l'email du responsable de Master IA ?"
+            if not answer and "responsable" in q_low and "master" in q_low and (
+                "ia" in q_low or "intelligence artificielle" in q_low
+            ):
+                ml_resp = next(
+                    (c for c in contacts if c.email),
+                    contacts[0]
+                )
+
+                answer = f"L'email du responsable de Master IA est : {ml_resp.email or 'non renseigné'}"
+                final_confidence = 0.9
+                sources = [
+                    Source(
+                        type="contacts",
+                        id=ml_resp.id,
+                        title=ml_resp.nom_complet or ml_resp.sous_categorie or ml_resp.categorie_principale,
+                    )
+                ]
+
+            # "Quels sont les horaires de la bibliothèque ?"
+            if not answer and (
+                "horaires" in q_low and (
+                    "biblio" in q_low or "bibliothèque" in q_low or "bibliotheque" in q_low
+                )
+            ):
+                bib = next(
+                    (
+                        c for c in contacts
+                        if (c.sous_categorie and "biblio" in c.sous_categorie.lower())
+                        or (c.categorie_principale and "biblio" in c.categorie_principale.lower())
+                    ),
+                    None,
+                )
+                if bib and bib.horaires:
+                    answer = f"Les horaires de la bibliothèque sont : {bib.horaires}"
+                    final_confidence = 0.9
+                    sources = [
+                        Source(
+                            type="contacts",
+                            id=bib.id,
+                            title=bib.nom_complet or bib.sous_categorie or bib.categorie_principale,
+                        )
+                    ]
+
+            # "Qui est l'enseignant de Machine Learning ?"
+            if not answer and "machine learning" in q_low:
+                ml_contact = next(
+                    (
+                        c for c in contacts
+                        if c.matieres_specialite
+                        and "machine learning" in c.matieres_specialite.lower()
+                    ),
+                    None,
+                )
+                if ml_contact:
+                    answer = (
+                        f"L'enseignant(e) de Machine Learning est "
+                        f"{ml_contact.nom_complet or ml_contact.role or 'non renseigné(e)'}."
+                    )
+                    final_confidence = 0.9
+                    sources = [
+                        Source(
+                            type="contacts",
+                            id=ml_contact.id,
+                            title=ml_contact.nom_complet or ml_contact.sous_categorie or ml_contact.categorie_principale,
+                        )
+                    ]
+
+            # "Comment joindre l'infirmerie ?"
+            if not answer and ("infirmerie" in q_low or "santé" in q_low or "sante" in q_low):
+                inf = next(
+                    (
+                        c for c in contacts
+                        if c.sous_categorie and "infirmerie" in c.sous_categorie.lower()
+                    ),
+                    None,
+                )
+                if inf:
+                    answer = (
+                        "Tu peux joindre l'infirmerie par téléphone au "
+                        f"{inf.telephone or 'numéro non renseigné'} "
+                        f"ou par email à {inf.email or 'adresse non renseignée'}. "
+                        f"Les horaires d'ouverture sont : {inf.horaires or 'non renseignés'}."
+                    )
+                    final_confidence = 0.9
+                    sources = [
+                        Source(
+                            type="contacts",
+                            id=inf.id,
+                            title=inf.nom_complet or inf.sous_categorie or inf.categorie_principale,
+                        )
+                    ]
+
+            # "Numéro d'urgence campus ?"
+            if not answer and ("urgence" in q_low and "campus" in q_low):
+                urgence = next(
+                    (
+                        c for c in contacts
+                        if c.sous_categorie and "urgence campus" in c.sous_categorie.lower()
+                    ),
+                    None,
+                )
+                if urgence:
+                    answer = (
+                        f"Le numéro d'urgence campus est le {urgence.telephone or 'non renseigné'} "
+                        f"(service : {urgence.nom_complet or urgence.sous_categorie or 'Urgence Campus ESIC'})."
+                    )
+                    final_confidence = 0.95
+                    sources = [
+                        Source(
+                            type="contacts",
+                            id=urgence.id,
+                            title=urgence.nom_complet or urgence.sous_categorie or urgence.categorie_principale,
+                        )
+                    ]
+
+            # Rendu générique si rien de spécifique
+            if not answer:
+                lignes = []
+                for c in contacts:
+                    titre = c.nom_complet or c.sous_categorie or c.categorie_principale
+                    coords=[]
+                    if c.email:
+                        coords.append(f"email : {c.email}")
+                    if c.telephone:
+                        coords.append(f"téléphone : {c.telephone}")
+                    loc=[]
+                    if c.batiment:
+                        loc.append(c.batiment)
+                    if c.bureau:
+                        loc.append(f"bureau {c.bureau}")
+                    hor = f"horaires : {c.horaires}" if c.horaires else ""
+                    lignes.append(
+                        " - "
+                        + (titre or "Contact")
+                        + (" | " + " / ".join(loc) if loc else "")
+                        + (" | " + " | ".join(coords) if coords else "")
+                        + (" | " + hor if hor else "")
+                    )
+
+                answer = "Voici les contacts correspondants :\n" + "\n".join(lignes)
+                sources = [
+                    Source(
+                        type="contacts",
+                        id=c.id,
+                        title=c.nom_complet or c.sous_categorie or c.categorie_principale,
+                    )
+                    for c in contacts
+                ]
+
+    # 3.2 TIMETABLE
+    elif is_timetable_intent:
+        final_intent = "timetable"
+        final_confidence = max(0.7, model_conf)
+
+        user_program: str | None = None
+        user_group: str | None = None
+
+        slots = search_timetable(db, msg, program=user_program, group_name=user_group, limit=50)
+
+        if "quels sont mes cours" in q_low:
+            if slots:
+                lines = []
+                for s in slots:
+                    start_str = s.start_time.strftime("%H:%M")
+                    end_str = s.end_time.strftime("%H:%M")
+                    pieces = [
+                        f"{s.program}",
+                        f"{s.group_name}",
+                        f"{s.subject_name}",
+                        f"- {start_str}–{end_str}",
+                    ]
+                    lines.append(" ".join(p for p in pieces if p))
+                answer = "Voici tes cours :\n" + "\n".join(lines)
+                sources = [Source(type="timetable", id=0, title="timetable_slots")]
+            else:
+                final_intent = "fallback"
+                final_confidence = 0.2
+                answer = (
+                    "Je n’ai pas trouvé de cours pour ce jour.\n"
+                    "Peux-tu préciser ta formation/promo, ton groupe et éventuellement la date exacte ?"
+                )
+
+        elif "où se trouve le cours" in q_low or "ou se trouve le cours" in q_low:
+            if slots:
+                lignes = []
+                for s in slots:
+                    day_str = s.day
+                    start_str = s.start_time.strftime("%H:%M")
+                    end_str = s.end_time.strftime("%H:%M")
+                    salle = s.room_name or "salle non renseignée"
+                    pieces = [
+                        f"{day_str} {start_str}–{end_str}",
+                        f"{s.subject_name}",
+                        f"({s.program or ''} {s.group_name or ''})",
+                        f"en salle {salle}",
+                    ]
+                    lignes.append(" ".join(p for p in pieces if p.strip()))
+                answer = "Voici les créneaux trouvés pour ce cours :\n" + "\n".join(lignes)
+                sources = [Source(type="timetable", id=0, title="timetable_slots")]
+            else:
+                final_intent = "fallback"
+                final_confidence = 0.2
+                answer = (
+                    "Je n’ai pas trouvé de cours correspondant à ta description.\n"
+                    "Peux-tu préciser le nom exact de la matière, ta formation et ton groupe ?"
+                )
+
+        elif "qui enseigne" in q_low and "b3" in q_low:
+            if slots:
+                enseignants = {s.teacher for s in slots if s.teacher}
+                if len(enseignants) == 1:
+                    nom = next(iter(enseignants))
+                    answer = f"{nom}"
+                elif len(enseignants) > 1:
+                    answer = "Les enseignants trouvés sont : " + ", ".join(sorted(enseignants))
+                else:
+                    answer = "Je trouve des cours correspondants, mais les enseignants ne sont pas renseignés."
+                sources = [Source(type="timetable", id=0, title="timetable_slots")]
+            else:
+                final_intent = "fallback"
+                final_confidence = 0.2
+                answer = (
+                    "Je n’ai pas trouvé de cours correspondant à cette matière.\n"
+                    "Peux-tu préciser le nom exact de la matière (par ex. « Cybersécurité ») et la formation (ex. B3) ?"
+                )
+
+        elif "quand sont les examens de s1" in q_low:
+            exam_start, exam_end = (
+                db.query(
+                    func.min(TimetableSlot.exam_start),
+                    func.max(TimetableSlot.exam_end),
+                )
+                .filter(TimetableSlot.semester == "S1")
+                .one()
+            )
+
+            if exam_start and exam_end:
+                answer = (
+                    f"Les examens de S1 ont lieu du "
+                    f"{exam_start.strftime('%d/%m/%Y')} au {exam_end.strftime('%d/%m/%Y')}."
+                )
+                final_confidence = 0.9
+                sources = [Source(type="timetable", id=0, title="timetable_slots")]
+            else:
+                final_intent = "fallback"
+                final_confidence = 0.2
+                answer = (
+                    "Je n’ai pas trouvé les dates d’examens pour S1 dans la base.\n"
+                    "Vérifie ton ENT ou contacte la scolarité."
+                )
+
         else:
-            answer = f"{title}\n\n{content}".strip()
-            sources = [Source(type="kb", id=int(db_id), title=title)]
+            if slots:
+                lines = []
+                for s in slots:
+                    start_str = s.start_time.strftime("%H:%M")
+                    end_str = s.end_time.strftime("%H:%M")
+                    pieces = [
+                        f"- {start_str}–{end_str}",
+                        f"{s.subject_name}",
+                    ]
+                    if s.program:
+                        pieces.append(f"({s.program})")
+                    if s.group_name:
+                        pieces.append(f"[Groupe {s.group_name}]")
+                    if s.room_name:
+                        pieces.append(f"en salle {s.room_name}")
+                    if s.teacher:
+                        pieces.append(f"avec {s.teacher}")
+                    lines.append(" ".join(pieces))
+                answer = "Voici ce que j’ai trouvé pour ton planning :\n" + "\n".join(lines)
+                sources = [Source(type="timetable", id=0, title="timetable_slots")]
+            else:
+                final_intent = "fallback"
+                final_confidence = 0.2
+                answer = (
+                    "Je n’ai pas trouvé de cours correspondant.\n"
+                    "Peux-tu préciser ta formation/promo, ton groupe et une date ?"
+                )
 
-    # ---------------------------------------------------------
-    # 4) Fallback DB (si Elastic ne donne rien)
-    # ---------------------------------------------------------
-    if not answer:
-        faq = search_faq(db, msg, limit=3)
-        if faq:
-            final_intent = final_intent or "faq"
-            final_confidence = final_confidence or 0.70
-            answer = faq[0].answer
-            sources = [Source(type="faq", id=faq[0].id, title=faq[0].question)]
+    # 3.3 FAQ (générique)
+    elif is_faq_intent:
+        final_intent = "faq"
 
-    if not answer:
-        procs = search_procedures(db, msg, limit=3)
-        if procs:
-            p = procs[0]
-            final_intent = final_intent or "procedure"
-            final_confidence = final_confidence or 0.65
-            answer = f"{p.title}\n\n{p.summary or ''}".strip()
-            sources = [Source(type="procedure", id=p.id, title=p.title)]
+        if forced_faq_result is not None:
+            f = forced_faq_result
+        else:
+            category_id = None
+            if FAQ_MODEL is not None:
+                faq_cat_res = predict_faq_category(FAQ_MODEL, msg)
+                category_id = faq_cat_res.category_id
 
-    if not answer:
-        cons = search_contacts(db, msg, limit=3)
-        if cons:
-            c = cons[0]
-            final_intent = final_intent or "contact"
-            final_confidence = final_confidence or 0.60
-            lines = [f"Service : {c.service}"]
-            if c.name:
-                lines.append(f"Contact : {c.name}")
-            if c.email:
-                lines.append(f"Email : {c.email}")
-            if c.phone:
-                lines.append(f"Téléphone : {c.phone}")
-            if c.location:
-                lines.append(f"Lieu : {c.location}")
-            if c.hours:
-                lines.append(f"Horaires : {c.hours}")
-            answer = "\n".join(lines)
-            sources = [Source(type="contact", id=c.id, title=c.service)]
+            if category_id:
+                faq_results = search_faq(db, msg, category_id=category_id, limit=3)
+            else:
+                faq_results = search_faq(db, msg, order_by_frequency=True, limit=3)
 
-    # ---------------------------------------------------------
-    # 5) Ultimate fallback (clarification)
-    # ---------------------------------------------------------
-    if not answer:
-        final_intent = final_intent or "fallback"
-        final_confidence = final_confidence or 0.20
+            if not faq_results:
+                final_intent = "fallback"
+                final_confidence = 0.2
+                answer = (
+                    "Je n’ai pas trouvé de réponse précise dans la FAQ.\n"
+                    "Peux-tu reformuler ou préciser ta question ?"
+                )
+                faq_results = []
+
+            f = faq_results[0] if faq_results else None
+
+        if f is not None:
+            answer = f.answer
+            final_confidence = max(0.9, model_conf)
+            sources = [
+                Source(
+                    type="faq",
+                    id=f.id,
+                    title=f.question,
+                )
+            ]
+
+    else:
+        final_intent = "fallback"
+        final_confidence = 0.1
         answer = (
-            "Je n’ai pas trouvé une réponse certaine.\n"
-            "Peux-tu préciser : (1) le sujet, (2) ta formation/promo, (3) une date si c’est lié au planning ?"
+            "Je ne suis pas sûr de comprendre si ta question concerne un contact, "
+            "un emploi du temps ou une question générale de la FAQ.\n"
+            "Peux-tu reformuler en précisant ce que tu cherches ?"
         )
 
+    # ------------------------
+    # 4) Log + réponse
+    # ------------------------
     latency_ms = int((time.time() - start) * 1000)
 
-    # ---------------------------------------------------------
-    # 6) Log obligatoire
-    # ---------------------------------------------------------
+    if not answer:
+        answer = (
+            "Je n’ai pas trouvé de réponse précise.\n"
+            "Peux-tu préciser ta question ou le service concerné ?"
+        )
+
     event = ChatEvent(
         user_hash=user_hash,
         channel=payload.channel,
@@ -257,10 +566,20 @@ def chat(
         resolved=(final_intent != "fallback"),
         latency_ms=latency_ms,
     )
-
     db.add(event)
     db.commit()
     db.refresh(event)
+
+    print("DEBUG:", final_intent, final_confidence, answer)
+    print(
+        "DEBUG_FLAGS:",
+        q_low,
+        "model_intent=", model_intent,
+        "conf=", model_conf,
+        "contact=", is_contact_intent,
+        "timetable=", is_timetable_intent,
+        "faq=", is_faq_intent,
+    )
 
     return ChatResponse(
         answer=answer,
@@ -269,19 +588,3 @@ def chat(
         confidence=final_confidence,
         sources=sources,
     )
-
-
-# ------------------------
-# FEEDBACK
-# ------------------------
-@router.post("/feedback")
-def feedback(payload: FeedbackRequest, db: Session = Depends(get_db)):
-    fb = Feedback(
-        chat_event_id=payload.chat_event_id,
-        rating=payload.rating,
-        comment=payload.comment,
-        corrected_answer=payload.corrected_answer,
-    )
-    db.add(fb)
-    db.commit()
-    return {"status": "ok"}

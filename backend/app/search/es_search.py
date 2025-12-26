@@ -1,4 +1,3 @@
-# app/search/es_search.py
 from typing import Any, Dict, List, Tuple
 from elasticsearch import Elasticsearch
 from app.search.es_client import INDEX

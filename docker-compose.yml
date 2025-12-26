@@ -37,16 +37,6 @@ services:
     ports:
       - "8000:8000"
 
-  superset:
-    image: apache/superset:latest
-    container_name: av_superset
-    environment:
-      SUPERSET_SECRET_KEY: supersecretkey
-    ports:
-      - "8088:8088"
-    depends_on:
-      - postgres
-
   # -----------------------
   # Observability
   # -----------------------

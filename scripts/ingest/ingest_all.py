@@ -5,6 +5,7 @@ SCRIPTS = [
     "/scripts/ingest/ingest_faq.py",
     "/scripts/ingest/ingest_contacts.py",
     "/scripts/ingest/ingest_procedures.py",
+    "/scripts/ingest/ingest_timetable.py",
 ]
 
 def run(path: str):

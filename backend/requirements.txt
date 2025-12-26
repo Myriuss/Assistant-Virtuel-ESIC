@@ -1,8 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-
-# Force a CPU-only PyTorch wheel (avoids huge CUDA deps in CI runners)
-torch==2.2.2+cpu
-
+torch==2.2.2
+pandas
 fastapi
 uvicorn
 sqlalchemy

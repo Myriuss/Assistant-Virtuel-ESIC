@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List
 
 sys.path.append("/app")  # backend est monté sur /app dans le container
 
@@ -11,71 +11,65 @@ from app.db.models import FAQItem
 
 RAW_PATH = os.getenv("FAQ_PATH", "/data/raw/faq_complete.json")
 
-Q_KEYS = {"question", "q", "question_fr", "questionFR", "questionFr", "demande", "ask"}
-A_KEYS = {"answer", "a", "reponse", "réponse", "reponse_fr", "answer_fr", "response", "réponse_fr"}
-CAT_KEYS = {"category", "categorie", "cat", "theme", "thème"}
-LANG_KEYS = {"language", "lang", "locale"}
-
-def _iter_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
-    """Parcourt récursivement dict/list et yield chaque dict rencontré."""
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from _iter_dicts(v)
-    elif isinstance(obj, list):
-        for it in obj:
-            yield from _iter_dicts(it)
-
-def _pick_first(d: Dict[str, Any], keys: set) -> Optional[str]:
-    for k in d.keys():
-        if k in keys and d.get(k) is not None:
-            val = d.get(k)
-            if isinstance(val, str):
-                s = val.strip()
-                return s if s else None
-    # tentative “case-insensitive”
-    lower = {k.lower(): k for k in d.keys()}
-    for kk in keys:
-        if kk.lower() in lower:
-            val = d.get(lower[kk.lower()])
-            if isinstance(val, str):
-                s = val.strip()
-                return s if s else None
-    return None
-
 def main():
     db: Session = SessionLocal()
     try:
         with open(RAW_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data: Dict[str, Any] = json.load(f)
+
+        categories: List[Dict[str, Any]] = data.get("categories", [])
 
         inserted = 0
-        scanned = 0
-        for d in _iter_dicts(data):
-            scanned += 1
-            q = _pick_first(d, Q_KEYS)
-            a = _pick_first(d, A_KEYS)
 
-            if not q or not a:
+        for cat in categories:
+            category_id = cat.get("id")            # ex: "emploi_temps"
+            category_name = cat.get("nom")        # ex: "Emplois du temps & Planning"
+
+            questions = cat.get("questions", [])
+            if not isinstance(questions, list):
                 continue
 
-            category = _pick_first(d, CAT_KEYS)
-            language = _pick_first(d, LANG_KEYS) or "fr"
-            tags = d.get("tags") if isinstance(d.get("tags"), list) else None
+            for q in questions:
+                faq_id = q.get("id")              # ex: "EDT001"
+                question = q.get("question")
+                answer = q.get("reponse") or q.get("réponse") or q.get("answer")
 
-            db.add(FAQItem(
-                question=q,
-                answer=a,
-                category=category,
-                tags=tags,
-                language=language
-            ))
-            inserted += 1
+                if not question or not answer:
+                    continue
+
+                tags = q.get("tags") or []
+                if not isinstance(tags, list):
+                    tags = []
+
+                documents = q.get("documentsassocies") or []
+                if not isinstance(documents, list):
+                    documents = []
+
+                frequency = q.get("frequence") or "moyenne"
+
+                # Ici on suppose pour l’instant uniquement la version FR
+                language = "fr"
+
+                item = FAQItem(
+                    faq_id=faq_id,
+                    category_id=category_id,
+                    category_name=category_name,
+                    question=question,
+                    answer=answer,
+                    tags=tags,
+                    documents=documents,
+                    frequency=frequency,
+                    language=language,
+                )
+                db.add(item)
+                inserted += 1
 
         db.commit()
-        print(f"[OK] FAQ scan dicts: {scanned} | inserted: {inserted} | file: {RAW_PATH}")
+        print(f"[OK] FAQ inserted: {inserted} | file: {RAW_PATH}")
+
     finally:
         db.close()
+
 
 if __name__ == "__main__":
     main()
