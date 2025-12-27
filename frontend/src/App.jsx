@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 const SUGGESTIONS = [
-  "Je veux joindre la scolarité à Paris",
-  "J'ai un problème avec mon emploi du temps",
-  "Comment récupérer mon certificat de scolarité ?",
-  "Je n'arrive pas à me connecter à l'ENT",
+  "Combien de temps durent les examens ?",
+  "Qui enseigne la Cybersécurité en B3 ?",
+  "Comment contacter le service scolarité ?",
+  "Quel est l'email du responsable de Master IA ?",
+  "Quels sont les horaires de la bibliothèque ?",
+  "Qui est l'enseignant de Machine Learning ?"
 ];
 
 function uid() {
