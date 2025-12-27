@@ -60,7 +60,7 @@ class ChatResponse(BaseModel):
 # CHAT ENDPOINT
 # ------------------------
 @router.post("/chat", response_model=ChatResponse)
-#@limiter.limit("10/minute")
+@limiter.limit("10/minute")
 def chat(
     payload: ChatRequest,
     request: Request,
