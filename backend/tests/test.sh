@@ -24,7 +24,7 @@ questions=(
 "Combien d'heures de cours par semaine ?"
 "Mon emploi du temps a changé, comment suis-je informé ?"
 "Comment puis-je réserver une salle ?"
-"À quelle heure commencent les cours le matin ?"
+"À quelle heure commencent les cours le matin  ?"
 "Jusqu'à quelle heure y a-t-il des cours ?"
 "Y a-t-il cours le samedi ?"
 "Où se trouve ma salle de cours ?"
