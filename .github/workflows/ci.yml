@@ -1,3 +1,28 @@
+name: CI - Assistant Virtuel Campus
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+jobs:
+  backend:
+    name: Backend - Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backend Docker build
+        run: docker build -t av-backend-ci ./backend
+
+  frontend:
+    name: Frontend - Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Frontend Docker build
+        run: docker build -t av-frontend-ci ./frontend
+
   integration:
     name: Integration - Smoke test API
     runs-on: ubuntu-latest
