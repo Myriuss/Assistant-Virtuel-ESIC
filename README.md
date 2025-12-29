@@ -136,9 +136,16 @@ Le premier démarrage peut prendre plusieurs minutes.
 
 ---
 
+## Ingestion des données
+
+### Ingestion complète
+```bash
+docker exec -it av_backend python /scripts/ingest/ingest_all.py
+```
 ## 8. Vérifications après installation
 
 ### Backend
+
 ```bash
 curl http://localhost:8000/health
 ```
@@ -149,6 +156,14 @@ curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"user_id":"test","message":"Je veux joindre la scolarité","channel":"web"}'
 ```
+
+### Lancer un test automatique avec un script shell
+```bash
+chmod 777 backend/tests/test.sh
+./backend/tests/test.sh
+```
+
+
 
 ### Prometheus
 - Accès : http://localhost:9090/targets
@@ -212,11 +227,10 @@ curl http://localhost:3100/ready
 
 ---
 
-## 12. Évolutions possibles (reste à faire)
+## 12. Évolutions possibles 
 
-- Dashboard Grafana prêt à l’emploi
-- Frontend web de chat
-- Amélioration NLP (SBERT, FAISS)
+
+
 - Support multilingue avancé
 - Authentification utilisateur
 
