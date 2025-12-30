@@ -2,7 +2,7 @@ import csv
 import json
 import os
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from io import StringIO
 
@@ -91,6 +91,57 @@ def apply_exam_dates_from_json(db: Session, json_path: Path = JSON_PATH) -> None
     db.commit()
     print(f"[OK] Total rows updated with exam dates: {updated}")
 
+def apply_exam_epreuves_from_json(db: Session, json_path: Path = JSON_PATH) -> None:
+    if not json_path.exists():
+        print(f"[WARN] JSON file not found: {json_path}")
+        return
+
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    examens = data.get("examens", [])
+
+    created = 0
+    for bloc in examens:
+        formation = bloc["formation"]      # ex: "B3-DATA"
+        semestre = bloc["semestre"]       # "S1"
+        for epr in bloc.get("epreuves", []):
+            mat_code = epr["matiere_code"]    # "DATA301"
+            mat_nom = epr["matiere_nom"]      # "Machine Learning Avancé"
+            date_str = epr["date"]            # "2025-01-08"
+            heure_debut = epr["heure_debut"]  # "09:00"
+            duree_str = epr["duree"]          # "4h"
+            salle = epr["salle"]              # "C002"
+            type_epreuve = epr["type"]        # "Projet + Soutenance"
+
+            start_dt = datetime.strptime(f"{date_str} {heure_debut}", "%Y-%m-%d %H:%M")
+            # parse durée grossièrement
+            heures = int(duree_str.rstrip("h")) if duree_str.endswith("h") else 2
+            end_dt = start_dt + timedelta(hours=heures)
+
+            slot = TimetableSlot(
+                program=formation,
+                group_name=None,  
+                semester=semestre,
+                subject_code=mat_code,
+                subject_name=mat_nom,
+                course_type="EXAM",  
+                teacher_id=None,
+                teacher=None,
+                room_code=salle,
+                room_name=salle,
+                building=None,
+                day=start_dt.strftime("%A"),
+                start_time=start_dt,
+                end_time=end_dt,
+                exam_start=start_dt.date(),
+                exam_end=end_dt.date(),
+                raw=epr,
+            )
+            db.add(slot)
+            created += 1
+
+    db.commit()
+    print(f"[OK] Created exam slots from JSON: {created}")
+
 def main(csv_path: Path = CSV_PATH):
     db: Session = SessionLocal()
     try:
@@ -166,6 +217,7 @@ def main(csv_path: Path = CSV_PATH):
         db.commit()
         print(f"[OK] Inserted timetable slots: {inserted}")
         apply_exam_dates_from_json(db)
+        apply_exam_epreuves_from_json(db)
     finally:
         db.close()
 

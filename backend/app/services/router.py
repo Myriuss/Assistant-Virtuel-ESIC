@@ -169,7 +169,16 @@ def search_faq(db: Session, query: str, limit: int = 5, category_id: str | None 
             # 0bis) Malus thématiques génériques
         faq_txt = _normalize((faq.question or "") + " " + (faq.answer or ""))
         q_txt = _normalize(query)
+        q_mentions_biblio = any(w in q_txt for w in ["biblio", "bibliotheque", "bibliothèque"])
+        q_mentions_horaires = any(w in q_txt for w in ["horaire", "horaires", "heure", "ouvre", "ouverture"])
+        faq_mentions_cours = ("cours" in faq_txt) or ("emploi du temps" in faq_txt)
+        if q_mentions_biblio and q_mentions_horaires:
+            if getattr(faq, "id", None) == 236:
+                score -= 20
+            if faq_mentions_cours:
+                score += 12
 
+                
         # Exams
         q_mentions_exam = ("examen" in q_txt) or ("examens" in q_txt)
         faq_mentions_exam = ("examen" in faq_txt) or ("examens" in faq_txt)

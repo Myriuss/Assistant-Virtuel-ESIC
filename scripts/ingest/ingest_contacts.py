@@ -18,7 +18,6 @@ PHONE_KEYS = {"phone", "tel", "telephone", "téléphone", "mobile"}
 LOC_BATIMENT_KEYS = {"batiment", "bâtiment", "building"}
 LOC_BUREAU_KEYS = {"bureau", "office", "salle"}
 HOURS_KEYS = {"hours", "horaires", "horaire"}
-ROLE_KEYS = {"fonction", "role", "rôle", "poste", "titre"}
 FORMATION_KEYS = {"formation", "programme"}
 COMMENT_KEYS = {"description", "missions"}
 
@@ -109,18 +108,15 @@ def _ingest_node(
         hours_val = _get_str(node, HOURS_KEYS)
         if hours_val:
             current_hours = hours_val
-
+        categorie_principale = _detect_categorie_principale(root_key)
         # construire un Contact si on a suffisamment d'infos
         email = _get_str(node, EMAIL_KEYS)
         telephone = _get_str(node, PHONE_KEYS)
         nom_complet = _build_nom_complet(node)
 
         if email or telephone or nom_complet:
-            categorie_principale = _detect_categorie_principale(root_key)
-            # hérite du service parent (ex: "Scolarité")
             sous_categorie = current_service
-
-            role = _get_str(node, ROLE_KEYS)
+            role = None
 
             type_contact = "Personne"
             if node.get("service") or node.get("organisme"):
@@ -165,6 +161,37 @@ def _ingest_node(
                 commentaires=commentaires,
             )
             db.add(contact)
+        if isinstance(node.get("responsable"), dict) and current_service:
+            resp_dict = node["responsable"]
+            resp_email = _get_str(resp_dict, EMAIL_KEYS)
+            resp_tel = _get_str(resp_dict, PHONE_KEYS)
+            resp_nom = _build_nom_complet(resp_dict)
+
+            if resp_email or resp_tel or resp_nom:
+                sous_categorie = current_service
+                role = f"Responsable {current_service}"
+
+                batiment = _get_str(node, LOC_BATIMENT_KEYS)
+                bureau = _get_str(node, LOC_BUREAU_KEYS)
+                horaires = _get_str(node, HOURS_KEYS) or current_hours
+
+                contact = Contact(
+                    categorie_principale=categorie_principale,
+                    sous_categorie=sous_categorie,
+                    role=role,
+                    nom_complet=resp_nom,
+                    type_contact="Personne",
+                    email=resp_email,
+                    telephone=resp_tel,
+                    batiment=batiment,
+                    bureau=bureau,
+                    horaires=horaires,
+                    formations_public=current_formation,
+                    matieres_specialite=None,
+                    statut=None,
+                    commentaires=_get_str(node, COMMENT_KEYS),
+                )
+                db.add(contact)
 
         # descente récursive
         for v in node.values():

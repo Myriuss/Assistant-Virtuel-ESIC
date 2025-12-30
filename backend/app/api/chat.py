@@ -15,8 +15,12 @@ from app.services.router import search_timetable, search_contacts, search_faq
 from app.nlp.intent_model import load_intent_model, predict_intent, load_faq_model, predict_faq_category
 from app.nlp.ner import extract_entities
 
+from app.nlp.sentiment_model import load_sentiment_model, predict_sentiment
+
 INTENT_MODEL = load_intent_model()
 FAQ_MODEL = load_faq_model()
+SENTIMENT_MODEL = load_sentiment_model()
+ESCALATION_URGENCY_THRESHOLD = 0.4
 
 router = APIRouter()
 
@@ -54,6 +58,8 @@ class ChatResponse(BaseModel):
     entities: Optional[dict]
     confidence: Optional[float]
     sources: list[Source]
+    sentiment: Optional[str] = None
+    urgency_score: Optional[float] = None
 
 
 # ------------------------
@@ -78,9 +84,38 @@ def chat(
             status_code=400,
             detail="Requête rejetée (contenu suspect). Reformule ta question simplement."
         )
+    
+    # Smalltalk : bonjour / comment tu vas
+    SMALLTALK_GREETINGS = [
+        "bonjour", "bonsoir", "salut", "coucou", "hello", "hi",
+    ]
+    SMALLTALK_HOW_ARE_YOU = [
+        "comment tu vas", "comment vas tu", "comment vas-tu",
+        "ça va", "ca va", "tu vas bien",
+    ]
+
+    is_greeting = any(
+        q_low == g or q_low.startswith(g + " ") for g in SMALLTALK_GREETINGS
+    )
+    is_how_are_you = any(expr in q_low for expr in SMALLTALK_HOW_ARE_YOU)
+
+    # 1bis) Sentiment + urgence (pour tous les messages)
+    sentiment_label = None
+    urgency_score = 0.0
+    if SENTIMENT_MODEL is not None:
+        sent_res = predict_sentiment(SENTIMENT_MODEL, msg)
+        sentiment_label = sent_res.label
+        urgency_score = sent_res.urgency_score
+        print("DEBUG_SENTIMENT:", msg, "->", sentiment_label, urgency_score)
 
     # 2) NLU : intent + entités
     entities: dict = extract_entities(msg) if msg else {}
+    user_program_name = entities.get("formation")
+    subject = entities.get("subject")
+    user_program = entities.get("program_code") or user_program_name
+    dates = entities.get("dates", [])
+    service_hint = entities.get("service_hint")
+
     final_intent: str = "fallback"
     final_confidence: float = 0.0
     answer: Optional[str] = None
@@ -128,6 +163,7 @@ def chat(
         is_contact_intent = False
 
     # b) Intent TIMETABLE
+    has_exam_word = any(w in q_low for w in ["exam", "examen", "examens"])
     is_timetable_intent = (
         (model_intent == "timetable" and model_conf >= 0.3)
         or "quels sont mes cours lundi" in q_low
@@ -136,6 +172,8 @@ def chat(
         or "qui enseigne la cybersécurité en b3" in q_low
         or "qui enseigne la cybersecurite en b3" in q_low
         or "quand sont les examens de s1" in q_low
+        or has_exam_word and ("machine learning" in q_low or subject)
+        or ("exam" in q_low and subject)
     )
     if "qui enseigne" in q_low and "b3" in q_low or "quand sont les examens de s1" in q_low:
         is_timetable_intent = True
@@ -173,6 +211,111 @@ def chat(
         if quick_faq:
             forced_faq_result = quick_faq[0]
             is_faq_intent = True
+
+    # Escalade après détection d'intent (plainte / urgence seulement)
+    plainte_keywords = [
+        "inadmissible", "scandaleux", "retard",
+        "mécontent", "mecontent", "en colère", "en colere",
+        "agaçant", "agacant",
+        "c'est la troisième fois", "c est la troisieme fois",
+        "personne ne me répond", "personne ne me repond",
+        "plainte", "réclamation", "reclamation",
+    ]
+
+    is_plainte_like = any(kw in q_low for kw in plainte_keywords)
+
+    can_escalate = (not is_timetable_intent and not ("qui est" in q_low or "qui enseigne" in q_low))
+
+    if (
+        can_escalate
+        and sentiment_label in {"frustration", "urgent"}
+        and urgency_score >= ESCALATION_URGENCY_THRESHOLD
+        and is_plainte_like
+    ):
+        print("DEBUG_ESCALATION_TRIGGERED", sentiment_label, urgency_score)
+        final_intent = "escalation"
+        final_confidence = 0.95
+        entities: dict = {}
+        sources: list[Source] = []
+
+        escalation_contacts = search_contacts(db, msg, limit=1)
+        contact = escalation_contacts[0] if escalation_contacts else None
+
+        if contact:
+            display_name = (
+                contact.nom_complet
+                or contact.sous_categorie
+                or contact.categorie_principale
+                or "le service concerné"
+            )
+
+            # rôle lisible
+            if contact.role:
+                role_label = contact.role
+            elif contact.sous_categorie:
+                role_label = f"Responsable de la {contact.sous_categorie}"
+            elif contact.categorie_principale:
+                role_label = f"Responsable {contact.categorie_principale}"
+            else:
+                role_label = "Responsable"
+
+            email = contact.email or "email non renseigné"
+            phone = contact.telephone or "téléphone non renseigné"
+            horaires = contact.horaires or "9h-17h"
+
+            answer = (
+                "Je comprends ta frustration et je suis désolé pour cette situation.\n"
+                "Cette situation nécessite une attention personnalisée.\n\n"
+                f"Je te mets en relation avec {display_name} ({role_label}).\n"
+                f"Email : {email} | Téléphone : {phone}\n"
+                f"Elle est généralement disponible de {horaires}.\n"
+                "Puis-je faire autre chose pour t'aider ?"
+            )
+
+            sources = [
+                Source(
+                    type="contacts",
+                    id=contact.id,
+                    title=display_name,
+                )
+            ]
+        else:
+            answer = (
+                "Je comprends ta frustration et je suis désolé pour cette situation.\n"
+                "Cette situation nécessite une attention personnalisée.\n\n"
+                "Contacte directement la scolarité via ton ENT ou au guichet.\n"
+                "Souhaites-tu que je t’indique leurs coordonnées ?"
+            )
+
+        latency_ms = int((time.time() - start) * 1000)
+
+        event = ChatEvent(
+            user_hash=user_hash,
+            channel=payload.channel,
+            user_message=msg,
+            detected_language=payload.language,
+            intent=final_intent,
+            entities=entities,
+            response=answer,
+            confidence=final_confidence,
+            resolved=True,
+            latency_ms=latency_ms,
+            sentiment=sentiment_label,
+            urgency_score=urgency_score,
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+
+        return ChatResponse(
+            answer=answer,
+            intent=final_intent,
+            entities=entities,
+            confidence=final_confidence,
+            sources=sources,
+            sentiment=sentiment_label,
+            urgency_score=urgency_score,
+        )
 
     # ------------------------
     # 3) ROUTAGE PAR INTENT
@@ -369,7 +512,6 @@ def chat(
         final_intent = "timetable"
         final_confidence = max(0.7, model_conf)
 
-        user_program: str | None = None
         user_group: str | None = None
 
         slots = search_timetable(db, msg, program=user_program, group_name=user_group, limit=50)
@@ -396,6 +538,43 @@ def chat(
                     "Je n’ai pas trouvé de cours pour ce jour.\n"
                     "Peux-tu préciser ta formation/promo, ton groupe et éventuellement la date exacte ?"
                 )
+        
+        elif "exam" in q_low and subject and slots:
+            # filtrer les créneaux d'examen pour cette matière
+            exam_slots = [
+                s for s in slots
+                if s.subject_name and subject.lower() in s.subject_name.lower()
+                and s.course_type == "EXAM"
+            ]
+
+            if exam_slots:
+                # ici tu peux choisir 1 écrit + 1 soutenance, ou juste lister
+                lignes = []
+                for s in exam_slots:
+                    date_str = s.exam_start.strftime("%A %d %B")
+                    if s.start_time and s.end_time:
+                        heure_str = f"{s.start_time.strftime('%Hh%M')}-{s.end_time.strftime('%Hh%M')}"
+                    else:
+                        heure_str = ""
+                    salle = s.room_name
+                    exam_type = None
+                    if isinstance(s.raw, dict):
+                        exam_type = s.raw.get("type")
+                    lignes.append(f"- {exam_type}: {date_str}, {heure_str}, {salle}")
+
+                answer = (
+                    f"Pour la formation {user_group}, "
+                    f"les examens de {subject} sont programmés :\n"
+                    + "\n".join(lignes)
+                    + "\nSouhaites-tu consulter le planning complet de tes examens ?"
+                )
+                sources = [Source(type="timetable", id=0, title="timetable_slots")]
+            else:
+                answer = (
+                    "Je n’ai pas trouvé les examens correspondant à cette matière dans ton planning.\n"
+                    "Peux-tu vérifier ton ENT ou contacter la scolarité ?"
+                )
+                final_confidence = 0.4
 
         elif "où se trouve le cours" in q_low or "ou se trouve le cours" in q_low:
             if slots:
@@ -523,8 +702,20 @@ def chat(
 
             f = faq_results[0] if faq_results else None
 
+        if "comment faire ma demande" in q_low:
+            answer = (
+                "Je peux vous aider ! Pouvez-vous préciser quel type de demande :\n"
+                "- Demande de stage / alternance\n"
+                "- Certificat de scolarité\n"
+                "- Aide au logement\n"
+                "- Bourse d’études\n"
+                "ou autre chose ?"
+            )
+            entities = {}
+            sources = []
+
         if f is not None:
-            answer = f.answer
+            raw_answer = f.answer
             final_confidence = max(0.9, model_conf)
             sources = [
                 Source(
@@ -533,6 +724,24 @@ def chat(
                     title=f.question,
                 )
             ]
+            if "bibliothèque" in q_low or "bibliotheque" in q_low:
+                lines = raw_answer.splitlines()
+                normal_lines = [l.strip("- ").strip() for l in lines if "Lundi-Vendredi" in l or "Samedi" in l or "Dimanche" in l]
+                if len(normal_lines) >= 3:
+                    answer = (
+                        "Bonjour ! La bibliothèque est ouverte :\n"
+                        f"- {normal_lines[0]}\n"
+                        f"- {normal_lines[1]}\n"
+                        f"- {normal_lines[2]}\n"
+                        "Puis-je vous aider avec autre chose ?"
+                    )
+                else:
+                    answer = raw_answer
+        else:
+            answer = raw_answer
+
+    
+
 
     else:
         final_intent = "fallback"
@@ -565,6 +774,8 @@ def chat(
         confidence=final_confidence,
         resolved=(final_intent != "fallback"),
         latency_ms=latency_ms,
+        sentiment=sentiment_label,
+        urgency_score=urgency_score,
     )
     db.add(event)
     db.commit()
@@ -587,4 +798,6 @@ def chat(
         entities=entities,
         confidence=final_confidence,
         sources=sources,
+        sentiment=sentiment_label,
+        urgency_score=urgency_score,
     )

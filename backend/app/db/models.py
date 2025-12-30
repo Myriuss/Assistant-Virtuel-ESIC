@@ -88,7 +88,7 @@ class TimetableSlot(Base):
 
     subject_code = Column(String(50), nullable=True)   # matiere_code
     subject_name = Column(String(255), nullable=True)  # matiere_nom
-    course_type = Column(String(20), nullable=True)    # type_cours (CM/TD/TP)
+    course_type = Column(String(20), nullable=True)    # type_cours (CM/TD/TP/EXAM)
 
     teacher_id = Column(String(50), nullable=True)     # enseignant_id
     teacher = Column(String(160), nullable=True)       # enseignant_nom
@@ -127,6 +127,8 @@ class ChatEvent(Base):
     confidence = Column(Float, nullable=True)
     resolved = Column(Boolean, default=True)
     latency_ms = Column(Integer, nullable=True)
+    sentiment = Column(String(40), nullable=True)
+    urgency_score = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class Feedback(Base):
